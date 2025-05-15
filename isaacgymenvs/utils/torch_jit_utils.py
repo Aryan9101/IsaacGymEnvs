@@ -79,6 +79,8 @@ def quat_apply(a, b):
 
 @torch.jit.script
 def quat_rotate(q, v):
+    q = q.reshape(-1, 4)
+    v = v.reshape(-1, 3)
     shape = q.shape
     q_w = q[:, -1]
     q_vec = q[:, :3]

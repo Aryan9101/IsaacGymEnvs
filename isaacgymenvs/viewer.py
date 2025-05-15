@@ -53,7 +53,7 @@ def launch_rlg_hydra(cfg: DictConfig):
     image = envs.render(mode="rgb_array")
     print("the image of Isaac Gym viewer is an array of shape", image.shape)
     for _ in range(10):
-        actions = 2.0 * torch.rand((num_envs,) + envs.action_space.shape, device = 'cuda:0') - 1.0
+        actions = torch.zeros((num_envs,) + envs.action_space.shape, device = 'cuda:0') # 2.0 * torch.rand((num_envs,) + envs.action_space.shape, device = 'cuda:0') - 1.0
         envs.step(actions)
     envs.close()
  

@@ -35,13 +35,27 @@ from isaacgym import gymtorch
 from isaacgym import gymapi
 
 from isaacgymenvs.utils.torch_jit_utils import scale, unscale, quat_mul, quat_conjugate, quat_from_angle_axis, \
-    to_torch, get_axis_params, torch_rand_float, tensor_clamp, quat_apply
+    to_torch, get_axis_params, torch_rand_float, tensor_clamp, quat_apply, quat_rotate
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
 
 class AllegroHand106b(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
+
+        data_list = []
+        data_dir = "tasks/data"
+        for filename in os.listdir(data_dir):
+            if filename.endswith(".json"):
+                file_path = os.path.join(data_dir, filename)
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                    joint_pos = data["allegro_joint_positions"]
+                    data["allegro_joint_positions"] = to_torch(joint_pos[:4] + joint_pos[8:] + joint_pos[4:8])
+                    data["cube_pose_base_link_quat_xyzw"] = to_torch(data["cube_pose_base_link_quat_xyzw"])
+                    data_list.append(data)
+
+        self.data_list = data_list
 
         self.cfg = cfg
 
@@ -194,15 +208,6 @@ class AllegroHand106b(VecTask):
                                            * torch.rand(self.num_envs, device=self.device) + torch.log(self.force_prob_range[1]))
 
         self.rb_forces = torch.zeros((self.num_envs, self.num_bodies, 3), dtype=torch.float, device=self.device)
-        
-        data_list = []
-        data_dir = "tasks/data"
-        for filename in os.listdir(data_dir):
-            if filename.endswith(".json"):
-                file_path = os.path.join(data_dir, filename)
-                with open(file_path, "r") as f:
-                    data = json.load(f)
-                    data_list.append(data)
 
     def create_sim(self):
         self.dt = self.sim_params.dt
@@ -292,6 +297,9 @@ class AllegroHand106b(VecTask):
 
         object_asset_options.disable_gravity = True
         goal_asset = self.gym.load_asset(self.sim, asset_root, object_asset_file, object_asset_options)
+        
+        goal_hand_pose = self.data_list[0]["allegro_joint_positions"]        
+        obj_pose_rel_to_palm_link = self.data_list[0]["cube_pose_base_link_quat_xyzw"]
 
         allegro_hand_start_pose = gymapi.Transform()
         allegro_hand_start_pose.p = gymapi.Vec3(*get_axis_params(0.5, self.up_axis_idx))
@@ -350,13 +358,51 @@ class AllegroHand106b(VecTask):
                                            allegro_hand_start_pose.r.x, allegro_hand_start_pose.r.y, allegro_hand_start_pose.r.z, allegro_hand_start_pose.r.w,
                                            0, 0, 0, 0, 0, 0])
             self.gym.set_actor_dof_properties(env_ptr, allegro_hand_actor, allegro_hand_dof_props)
+            
+            # Apply the goal hand pose to the DOFs
+            allegro_hand_dof_states = self.gym.get_actor_dof_states(env_ptr, allegro_hand_actor, gymapi.STATE_ALL)
+            
+            # Set position targets from goal_hand_pose
+            for j in range(len(allegro_hand_dof_states)):
+                allegro_hand_dof_states[j][0] = goal_hand_pose[j]
+                # Optionally set velocity to zero
+                allegro_hand_dof_states[j][1] = 0.0
+            
+            # Apply the modified DOF states
+            self.gym.set_actor_dof_states(env_ptr, allegro_hand_actor, allegro_hand_dof_states, gymapi.STATE_ALL)
+            
             hand_idx = self.gym.get_actor_index(env_ptr, allegro_hand_actor, gymapi.DOMAIN_SIM)
             self.hand_indices.append(hand_idx)
+            
+            # Get the pose of the palm link in world coordinates
+            palm_link_idx = self.gym.find_actor_rigid_body_index(env_ptr, allegro_hand_actor, "palm_link", gymapi.DOMAIN_SIM)            
+            palm_state = self.gym.get_actor_rigid_body_states(env_ptr, allegro_hand_actor, gymapi.STATE_ALL)[palm_link_idx]
+            palm_pose = palm_state["pose"]
+            palm_pos = palm_pose['p']
+            palm_quat = palm_pose['r']
+
+            # Store the palm pose for later use in computing object pose relative to palm
+            if not hasattr(self, 'palm_indices'):
+                self.palm_indices = []
+            self.palm_indices.append(palm_link_idx)
+            
+            # Compute the object pose in the world frame
+            # to find pose quat, we need to multiply the palm quat with the object quat
+            # to find pose pos, we need to add the palm pos to the object pos transformed by the palm quat
+            obj_quat = obj_pose_rel_to_palm_link[3:7]
+            object_start_pose_pos = to_torch(palm_pos) + quat_rotate(to_torch(palm_quat), obj_pose_rel_to_palm_link[0:3])
+            object_start_pose_pos = object_start_pose_pos.squeeze()
+            object_start_pose_quat = quat_mul(to_torch(palm_quat), obj_quat)
+            # object_start_pose.r = gymapi.Quat(quat_mul(palm_quat, obj_quat))
+            # object_start_pose.p = to_torch(palm_pos) + to_torch(obj_pose_rel_to_palm_link[0:3])
 
             # add object
             object_handle = self.gym.create_actor(env_ptr, object_asset, object_start_pose, "object", i, 0, 0)
-            self.object_init_state.append([object_start_pose.p.x, object_start_pose.p.y, object_start_pose.p.z,
-                                           object_start_pose.r.x, object_start_pose.r.y, object_start_pose.r.z, object_start_pose.r.w,
+            # self.object_init_state.append([object_start_pose.p.x, object_start_pose.p.y, object_start_pose.p.z,
+            #                                object_start_pose.r.x, object_start_pose.r.y, object_start_pose.r.z, object_start_pose.r.w,
+            #                                0, 0, 0, 0, 0, 0])
+            self.object_init_state.append([object_start_pose_pos[0].item(), object_start_pose_pos[1].item(), object_start_pose_pos[2].item(),
+                                           object_start_pose_quat[0].item(), object_start_pose_quat[1].item(), object_start_pose_quat[2].item(), object_start_pose_quat[3].item(),
                                            0, 0, 0, 0, 0, 0])
             object_idx = self.gym.get_actor_index(env_ptr, object_handle, gymapi.DOMAIN_SIM)
             self.object_indices.append(object_idx)
